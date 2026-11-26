@@ -1,0 +1,41 @@
+{
+  "name": "Generic iOS simulator health check",
+  "on": {
+    "workflow_dispatch": {}
+  },
+  "permissions": {},
+  "jobs": {
+    "health": {
+      "name": "health-${{ matrix.xcode }}",
+      "if": "github.event_name == 'workflow_dispatch' && github.run_attempt == 1 && github.event.repository.private == false",
+      "runs-on": "macos-26-intel",
+      "timeout-minutes": 15,
+      "strategy": {
+        "fail-fast": false,
+        "max-parallel": 2,
+        "matrix": {
+          "include": [
+            {
+              "xcode": "26.3",
+              "developer": "/Applications/Xcode_26.3.app/Contents/Developer"
+            },
+            {
+              "xcode": "26.4.1",
+              "developer": "/Applications/Xcode_26.4.1.app/Contents/Developer"
+            }
+          ]
+        }
+      },
+      "env": {
+        "DEVELOPER_DIR": "${{ matrix.developer }}",
+        "PROBE_XCODE_VERSION": "${{ matrix.xcode }}"
+      },
+      "steps": [
+        {
+          "name": "Check only the generic simulator environment",
+          "run": "python3 - <<'PY'\n\"\"\"Generic public-runner health probe. No application, credentials, or user data.\n\nRuns only against a fresh hosted simulator; no application is built or installed.\n\"\"\"\nimport json\nimport os\nimport platform\nimport re\nimport signal\nimport subprocess\nimport sys\nimport time\n\nRUNTIME = 'com.apple.CoreSimulator.SimRuntime.iOS-26-2'\nEXPECTED_VERSION = os.environ.get('PROBE_XCODE_VERSION','26.4.1')\nEXPECTED_BUILDS = {'26.3':'17C529','26.4.1':'17E202'}\n\n\ndef redact(text):\n    text=re.sub(r'\\b[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\\b','<simulator>',text)\n    return re.sub(r'/Users/[^/\\s]+','/Users/<runner>',text)\n\n\nclass ProbeStopped(RuntimeError):\n    pass\n\n\nclass Probe:\n    def __init__(self):\n        self.started=time.monotonic()\n        self.deadline=self.started+720\n        self.cleanup_deadline=self.started+780\n        self.device=None\n        self.stages=[]\n\n    def run(self,label,args,limit):\n        remaining=(self.cleanup_deadline if label=='shutdown' else self.deadline)-time.monotonic()\n        if remaining<=0:\n            raise ProbeStopped('Overall health-probe deadline reached')\n        begin=time.monotonic()\n        end=begin+min(limit,remaining)\n        print(json.dumps({'stage':label,'event':'started','elapsedSeconds':round(begin-self.started,2)}),flush=True)\n        child=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,start_new_session=True)\n        while True:\n            try:\n                output,_=child.communicate(timeout=max(.01,min(30,end-time.monotonic())))\n                break\n            except subprocess.TimeoutExpired as partial:\n                captured=partial.output or ''\n                if isinstance(captured,bytes):captured=captured.decode('utf-8',errors='replace')\n                if time.monotonic()<end:\n                    print(json.dumps({'stage':label,'event':'waiting','seconds':round(time.monotonic()-begin,2)}),flush=True)\n                    if captured:print(redact(captured[-700:]),flush=True)\n                    continue\n                try:os.killpg(child.pid,signal.SIGTERM)\n                except ProcessLookupError:pass\n                try:output,_=child.communicate(timeout=5)\n                except subprocess.TimeoutExpired:\n                    try:os.killpg(child.pid,signal.SIGKILL)\n                    except ProcessLookupError:pass\n                    output,_=child.communicate(timeout=5)\n                self.stages.append({'stage':label,'seconds':round(time.monotonic()-begin,2),'result':'timeout'})\n                print(redact(output[-1500:]),flush=True)\n                raise ProbeStopped(label+' timed out; no automatic retry')\n        elapsed=round(time.monotonic()-begin,2)\n        self.stages.append({'stage':label,'seconds':elapsed,'result':child.returncode})\n        print(json.dumps(self.stages[-1]),flush=True)\n        if child.returncode:\n            print(redact(output[-1500:]),flush=True)\n            raise ProbeStopped(label+' failed')\n        return output\n\n    def check(self):\n        version=self.run('selected_xcode',['xcodebuild','-version'],30).strip()\n        print(version,flush=True)\n        if EXPECTED_VERSION not in EXPECTED_BUILDS:\n            raise ProbeStopped('Unreviewed Xcode version')\n        expected='Xcode '+EXPECTED_VERSION+'\\nBuild version '+EXPECTED_BUILDS[EXPECTED_VERSION]\n        if version!=expected or platform.system()!='Darwin' or platform.machine()!='x86_64':\n            raise ProbeStopped('Unexpected toolchain or runner architecture')\n        print('macOS '+self.run('host_os',['sw_vers','-productVersion'],15).strip(),flush=True)\n        print(json.dumps({'hostImage':{k:os.environ.get(k) for k in ['ImageOS','ImageVersion','RUNNER_ARCH']}}),flush=True)\n        self.resources('before_boot')\n        data=json.loads(self.run('available_simulators',['xcrun','simctl','list','devices','available','-j'],180))\n        candidates=[d for d in data['devices'].get(RUNTIME,[]) if d.get('isAvailable') and d['name']=='iPhone 17']\n        if len(candidates)!=1 or candidates[0]['state']!='Shutdown':\n            raise ProbeStopped('Expected one fresh Shutdown iPhone17 under the pinned iOS26.2 runtime')\n        self.device=candidates[0]['udid']\n        self.run('boot',['xcrun','simctl','boot',self.device],60)\n        self.run('boot_ready',['xcrun','simctl','bootstatus',self.device,'-b'],600)\n        self.resources('after_boot')\n        print('SIMULATOR_READY: environment only; no application or XCTest has been tested.',flush=True)\n\n    def resources(self,phase):\n        commands=[('memory',['sysctl','hw.memsize','hw.ncpu','vm.swapusage']),\n                  ('pages',['vm_stat']),('disk',['df','-k','/']),\n                  ('simulator_processes',['ps','-axo','comm=,stat=,rss=,%cpu='])]\n        for label,args in commands:\n            try:\n                output=self.run(phase+'_'+label,args,10)\n                if label=='simulator_processes':\n                    output='\\n'.join(line for line in output.splitlines() if re.search(r'CoreSimulator|simdiskimaged|launchd_sim|SpringBoard|backboardd',line))\n                print(json.dumps({'snapshot':phase,'kind':label,'text':redact(output[-4000:])}),flush=True)\n            except ProbeStopped as error:\n                print(json.dumps({'snapshot':phase,'kind':label,'unavailable':str(error)}),flush=True)\n\n    def execute(self):\n        failure=None\n        try:\n            self.check()\n        except (ProbeStopped,ValueError,KeyError) as error:\n            failure=error\n        finally:\n            if self.device:\n                try:self.run('shutdown',['xcrun','simctl','shutdown',self.device],45)\n                except ProbeStopped as error:\n                    print('Cleanup: '+str(error),flush=True)\n                    if failure is None:failure=error\n        print(json.dumps({'scope':'generic simulator health only','stages':self.stages,\n          'xcode':EXPECTED_VERSION,'runtime':RUNTIME,\n          'applicationTested':False,'signed':False,'uploaded':False,'automaticRetries':0,\n          'result':'failed' if failure else 'ready'},indent=2),flush=True)\n        if failure:print(str(failure),file=sys.stderr)\n        return 1 if failure else 0\n\n\nif __name__=='__main__':\n    sys.exit(Probe().execute())\n\nPY\n"
+        }
+      ]
+    }
+  }
+}
